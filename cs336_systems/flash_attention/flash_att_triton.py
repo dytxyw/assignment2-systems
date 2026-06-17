@@ -111,7 +111,7 @@ class flash_attention_triton(torch.autograd.Function):
             K_TILE_SIZE = 32
         T_q = math.ceil(N_q / Q_TILE_SIZE)
         O_ptr = torch.empty_like(q)
-        L_ptr = torch.empty((batch_size, N_q), dtype=q.dtype, device=q.device)
+        L_ptr = torch.empty((batch_size, N_q), dtype=torch.float32, device=q.device)
 
         flash_fwd_kernel[(T_q, batch_size)](
             q, k, v,
@@ -144,11 +144,12 @@ class flash_attention_triton(torch.autograd.Function):
 
         @torch.compile
         def flash_backward_impl(Q, K, V, O, L, dO, is_causal):
-            Q = Q.to(tl.float)
-            K = K.to(tl.float)
-            V = V.to(tl.float)
-            O = O.to(tl.float)
-            dO = dO.to(tl.float)
+            Q = Q.to(torch.float32)
+            K = K.to(torch.float32)
+            V = V.to(torch.float32)
+            O = O.to(torch.float32)
+            dO = dO.to(torch.float32)
+            scale = Q.shape[-1] ** (-0.5)
 
             D = torch.sum(O * dO, dim=-1)  # (B, N_q)
             S = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (B, N_q, N_k)
@@ -165,9 +166,15 @@ class flash_attention_triton(torch.autograd.Function):
             dV = torch.matmul(P.transpose(-2, -1), dO)  # (B, N_k, D)
             dP = torch.matmul(dO, V.transpose(-2, -1))  # (B, N_q, N_k)
             dS = P * (dP - D.unsqueeze(-1))  # (B, N_q, N_k)
-            dQ = torch.matmul(dS, K)   # (B, N_q, D)
-            dK = torch.matmul(dS.transpose(-2, -1), Q) 
+            dQ = torch.matmul(dS, K) *scale  # (B, N_q, D)
+            dK = torch.matmul(dS.transpose(-2, -1), Q) * scale
             dQ = dQ.to(q.dtype)
             dK = dK.to(k.dtype)
             dV = dV.to(v.dtype)
-            return dQ, dK, dV, None
+            return dQ, dK, dV
+            
+
+    # FIX: 调用内部函数并返回结果
+        dQ, dK, dV = flash_backward_impl(q, k, v, O, L, grad_output, ctx.is_causal)
+        return dQ, dK, dV, None
+    

@@ -52,6 +52,7 @@ class flash_attention_pytorch(torch.autograd.Function):
         return O
     
     @staticmethod
+    @torch.compile
     def backward(ctx, grad_out: torch.Tensor):
         q, k, v, O, L = ctx.saved_tensors
         device = grad_out.device
@@ -74,7 +75,7 @@ class flash_attention_pytorch(torch.autograd.Function):
             L_b = L[batch]
             dO_b = grad_out[batch]
 
-            D_b = torch.sum(O * dO_b, dim = -1)
+            D_b = torch.sum(O_b * dO_b, dim = -1)
             for j in range(T_k):
                 K_start = j * B_k
                 K_end = min(N_k, (j + 1) * B_k)
@@ -93,18 +94,20 @@ class flash_attention_pytorch(torch.autograd.Function):
                     L_i = L_b[Q_start: Q_end]
                     D_i = D_b[Q_start: Q_end]
 
+                    S_ij = torch.matmul(Q_i, K_j.T) * scale
+
                     if ctx.is_causal:
                         q_indices = torch.arange(Q_start, Q_end, device=device)[:, None]
                         k_indices = torch.arange(K_start, K_end, device=device)[None, :]
-                        mask = q_indices > k_indices
+                        mask = q_indices >= k_indices
                         S_ij = torch.where(mask, S_ij, torch.tensor(float('-inf'), device=device))
 
                     P_ij = torch.exp(S_ij - L_i.unsqueeze(-1))
                     dV_j += P_ij.T @ dO_i
                     dP_ij = dO_i @ V_j.T
                     dS_ij = P_ij * (dP_ij - D_i.unsqueeze(-1)) * scale 
-                    dQ[batch, Q_start: Q_end, :] += dS_ij @ K_j
-                    dK_j = dS_ij.T @ Q_i
+                    dQ[batch, Q_start: Q_end, :] += dS_ij @ K_j 
+                    dK_j += dS_ij.T @ Q_i 
 
 
                 dK[batch, K_start: K_end, :] = dK_j
