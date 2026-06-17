@@ -134,7 +134,7 @@ wheels = [
 [[package]]
 name = "cs336-basics"
 version = "26.0.4"
-source = { editable = "cs336-basics" }
+source = { editable = "cs336_basics" }
 dependencies = [
     { name = "einops" },
     { name = "einx" },
@@ -192,7 +192,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cs336-basics", editable = "cs336-basics" },
+    { name = "cs336-basics", editable = "cs336_basics" },
     { name = "humanfriendly" },
     { name = "matplotlib" },
     { name = "numpy" },
