@@ -65,7 +65,7 @@ def flash_fwd_kernel(
         V_block_ptr = tl.make_block_ptr(
             V_ptr + stride_vb * batch_index,
             shape=(N_KEYS, D),
-            strides=(stride_vd, stride_vk),
+            strides=(stride_vk, stride_vd),
             offsets=(j * K_TILE_SIZE, 0),
             block_shape=(K_TILE_SIZE, D),
             order=(1, 0)
@@ -77,5 +77,97 @@ def flash_fwd_kernel(
             q_indices = tl.arange(0, Q_TILE_SIZE)[:, None]+ query_tile_index * Q_TILE_SIZE
             k_indices = tl.arange(0, K_TILE_SIZE)[None, :] + j * K_TILE_SIZE
             mask = q_indices >= k_indices
-            
+
             S_ij = tl.where(mask, S_ij, float('-inf'))
+        
+        m_i_new = tl.maximum(m_i, tl.max(S_ij, 1))
+        P_ij = tl.exp(S_ij - m_i_new[:, None])
+        m_scaler = tl.exp(m_i - m_i_new)
+        l_i = l_i * m_scaler + tl.sum(P_ij, 1)
+        o_i = o_i * m_scaler[:, None] + tl.dot(P_ij.to(tl.float32), V_j.to(tl.float32))
+        m_i = m_i_new
+
+    o_i = o_i * (1.0 / l_i[:, None])
+    l_i = tl.log(l_i) + m_i
+
+    tl.store(O_block_ptr, o_i.to(O_ptr.type.element_ty), boundary_check=(0,1))
+    tl.store(L_block_ptr, l_i.to(L_ptr.type.element_ty), boundary_check=(0,))
+
+class flash_attention_triton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, is_causal = False):
+        batch_size, N_q, D = q.shape
+        _, N_k, _ = k.shape
+
+        
+        if D <= 32:
+            Q_TILE_SIZE = 128
+            K_TILE_SIZE = 128
+        elif D <= 64:
+            Q_TILE_SIZE = 64
+            K_TILE_SIZE = 64
+        else:
+            Q_TILE_SIZE = 32
+            K_TILE_SIZE = 32
+        T_q = math.ceil(N_q / Q_TILE_SIZE)
+        O_ptr = torch.empty_like(q)
+        L_ptr = torch.empty((batch_size, N_q), dtype=q.dtype, device=q.device)
+
+        flash_fwd_kernel[(T_q, batch_size)](
+            q, k, v,
+            O_ptr, L_ptr,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            O_ptr.stride(0), O_ptr.stride(1), O_ptr.stride(2),
+            L_ptr.stride(0), L_ptr.stride(1),
+            N_q, N_k,
+            D ** (-0.5),
+            D, Q_TILE_SIZE, K_TILE_SIZE,
+            is_causal
+        )
+        ctx.save_for_backward(q, k, v, O_ptr, L_ptr)
+        ctx.is_causal = is_causal
+        return O_ptr
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        q, k, v, O, L = ctx.saved_tensors
+        device = grad_output.device
+        dQ = torch.empty_like(q)
+        dK = torch.empty_like(k)
+        dV = torch.empty_like(v)
+
+        batch_size, N_q, d_model = q.shape
+        _, N_k, _ = k.shape
+        scale = d_model ** (-0.5)
+
+        @torch.compile
+        def flash_backward_impl(Q, K, V, O, L, dO, is_causal):
+            Q = Q.to(tl.float)
+            K = K.to(tl.float)
+            V = V.to(tl.float)
+            O = O.to(tl.float)
+            dO = dO.to(tl.float)
+
+            D = torch.sum(O * dO, dim=-1)  # (B, N_q)
+            S = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (B, N_q, N_k)
+            if is_causal:
+                N_q = Q.shape[1]
+                N_k = K.shape[1]
+                q_indices = torch.arange(N_q, device=Q.device)[:, None]  # (1, N_q)
+                k_indices = torch.arange(N_k, device=K.device)[None, :]  # (N_k, 1)
+                mask = q_indices >= k_indices   
+                S = torch.where(mask, S, torch.tensor(float('-inf'), device=device))
+
+            P = torch.exp(S - L.unsqueeze(-1))    # (B, N_q, N_k)
+
+            dV = torch.matmul(P.transpose(-2, -1), dO)  # (B, N_k, D)
+            dP = torch.matmul(dO, V.transpose(-2, -1))  # (B, N_q, N_k)
+            dS = P * (dP - D.unsqueeze(-1))  # (B, N_q, N_k)
+            dQ = torch.matmul(dS, K)   # (B, N_q, D)
+            dK = torch.matmul(dS.transpose(-2, -1), Q) 
+            dQ = dQ.to(q.dtype)
+            dK = dK.to(k.dtype)
+            dV = dV.to(v.dtype)
+            return dQ, dK, dV, None
