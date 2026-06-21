@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-
+from torch import distributed as dist
 
 
 def get_flashattention_autograd_function_pytorch() -> type:
@@ -99,7 +99,9 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
         Instance of an FSDP class.
     """
     # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
+    # raise NotImplementedError
+    from cs336_systems.fsdp.fsdp import FSDP
+    return FSDP(module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -114,7 +116,9 @@ def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.O
             Optimizer being used with the FSDP-wrapped model.
     """
     # For example: fsdp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    # raise NotImplementedError
+    from cs336_systems.fsdp.fsdp import FSDP
+    fsdp_model.finish_gradient_synchronization()
 
 
 def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -128,7 +132,29 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     Returns:
         State dictionary mapping parameter names to full (unsharded) tensors.
     """
-    raise NotImplementedError
+    # raise NotImplementedError
+    state_dict = {}
+    
+    for name, param in fsdp_model.module.named_parameters():
+        param_id = id(param)
+        if param_id in fsdp_model._param_info:
+            # This is a sharded parameter - need to all-gather
+            info = fsdp_model._param_info[param_id]
+            sharded = info['sharded']
+            
+            # All-gather the shards
+            shards = [torch.empty_like(sharded.data) for _ in range(fsdp_model.world_size)]
+            torch.dist.all_gather(shards, sharded.data)
+            full = torch.cat(shards, dim=0)
+            
+            state_dict[name] = full
+        else:
+            # This is a replicated parameter (like RMSNorm) - return as-is
+            state_dict[name] = param.data.clone()
+    
+    return state_dict
+
+
 
 
 def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
